@@ -1,85 +1,219 @@
+#!/usr/bin/env python3
+"""
+WhatsApp Backup Downloader
+
+Downloads WhatsApp backups from Google Drive using the Google Backup API.
+Uses gpsoauth for authentication to access WhatsApp's private backup data.
+"""
+
+import sys
 from src.config import Config
-from src.drive_service import DriveService
-from src.backup_finder import BackupFinder
-from src.downloader import Downloader
-import os
+from src.google_auth import GoogleAuth
+from src.backup_api import BackupAPI
+
+
+def print_help():
+    print("""
+WhatsApp Backup Downloader
+==========================
+
+Downloads WhatsApp backups from Google Drive using gpsoauth authentication.
+
+Usage: python main.py <command>
+
+Commands:
+    help     Show this help message
+    setup    Configure Google account credentials
+    info     Show WhatsApp backup metadata (size, file count)
+    list     List all WhatsApp backup files
+    sync     Download all WhatsApp backup files
+
+Examples:
+    python main.py setup    # First time setup
+    python main.py info     # Show backup info
+    python main.py list     # List all files in backup
+    python main.py sync     # Download all backup files
+
+Requirements:
+    - Google account email and password (or App Password if 2FA enabled)
+    - Android device ID (from: adb shell settings get secure android_id)
+""")
+
+
+def format_size(size_bytes: int) -> str:
+    """Format size in human-readable format."""
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    elif size_bytes < 1024 * 1024:
+        return f"{size_bytes / 1024:.1f} KB"
+    elif size_bytes < 1024 * 1024 * 1024:
+        return f"{size_bytes / (1024 * 1024):.2f} MB"
+    else:
+        return f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
+
+
+def cmd_setup(config: Config):
+    """Setup credentials."""
+    config.prompt_credentials()
+    print("\nSetup complete! You can now run other commands.")
+
+
+def cmd_info(api: BackupAPI):
+    """Show backup info."""
+    info = api.get_backup_info()
+
+    if not info:
+        print("No WhatsApp backup found.")
+        return
+
+    print("\n" + "=" * 60)
+    print("WhatsApp Backup Info")
+    print("=" * 60)
+
+    print(f"\nBackup Name: {info['name']}")
+    print(f"Total Size: {format_size(info['size_bytes'])}")
+    print(f"Last Updated: {info['update_time']}")
+
+    metadata = info.get('metadata', {})
+    if metadata:
+        print("\nBackup Details:")
+        print("-" * 40)
+
+        if 'numOfMessages' in metadata:
+            print(f"  Messages: {metadata['numOfMessages']:,}")
+        if 'numOfMediaFiles' in metadata:
+            print(f"  Media Files: {metadata['numOfMediaFiles']:,}")
+        if 'numOfPhotos' in metadata:
+            print(f"  Photos: {metadata['numOfPhotos']:,}")
+        if 'chatdbSize' in metadata:
+            print(f"  Chat DB Size: {format_size(int(metadata['chatdbSize']))}")
+        if 'mediaSize' in metadata:
+            print(f"  Media Size: {format_size(int(metadata['mediaSize']))}")
+        if 'videoSize' in metadata:
+            print(f"  Video Size: {format_size(int(metadata['videoSize']))}")
+        if 'versionOfAppWhenBackup' in metadata:
+            print(f"  WhatsApp Version: {metadata['versionOfAppWhenBackup']}")
+        if 'passwordProtectedBackupEnabled' in metadata:
+            protected = "Yes" if metadata['passwordProtectedBackupEnabled'] else "No"
+            print(f"  Password Protected: {protected}")
+
+    print("=" * 60)
+
+
+def cmd_list(api: BackupAPI):
+    """List all backup files."""
+    files = api.list_files()
+
+    if not files:
+        print("No files found in backup.")
+        return
+
+    print("\n" + "=" * 80)
+    print("WhatsApp Backup Files")
+    print("=" * 80)
+    print(f"\n{'Filename':<60} {'Size':>15}")
+    print("-" * 77)
+
+    total_size = 0
+    for file_info in files:
+        name = file_info.get("name", "Unknown")
+        size = int(file_info.get("sizeBytes", 0))
+        total_size += size
+
+        # Extract relative path
+        parts = name.split("/files/", 1)
+        relative_path = parts[1] if len(parts) > 1 else name.split("/")[-1]
+
+        # Truncate long filenames
+        if len(relative_path) > 58:
+            relative_path = "..." + relative_path[-55:]
+
+        print(f"{relative_path:<60} {format_size(size):>15}")
+
+    print("-" * 77)
+    print(f"{'Total: ' + str(len(files)) + ' files':<60} {format_size(total_size):>15}")
+    print("=" * 80)
+
+
+def cmd_sync(api: BackupAPI, output_dir: str):
+    """Download all backup files."""
+    files = api.list_files()
+
+    if not files:
+        print("No files found in backup.")
+        return
+
+    total_size = sum(int(f.get("sizeBytes", 0)) for f in files)
+    print(f"\nFound {len(files)} files ({format_size(total_size)})")
+
+    confirm = input("Proceed with download? (y/n): ").strip().lower()
+    if confirm != 'y':
+        print("Download cancelled.")
+        return
+
+    stats = api.sync_all(output_dir)
+
+    print("\n" + "=" * 40)
+    print("Download Complete!")
+    print("=" * 40)
+    print(f"  Successfully downloaded: {stats['success']}")
+    print(f"  Skipped (already exist): {stats['skipped']}")
+    print(f"  Failed: {stats['failed']}")
+    print(f"\nFiles saved to: {output_dir}")
+
 
 def main():
-    print("WhatsApp Backup Downloader")
-    print("=========================")
-    
+    if len(sys.argv) < 2:
+        print_help()
+        sys.exit(1)
+
+    command = sys.argv[1].lower()
+
+    if command in ('help', '-h', '--help'):
+        print_help()
+        sys.exit(0)
+
     # Initialize configuration
     config = Config()
-    
+
+    # Handle setup command
+    if command == 'setup':
+        cmd_setup(config)
+        sys.exit(0)
+
+    # Load credentials
+    if not config.is_configured():
+        config.load_from_settings()
+
+    if not config.is_configured():
+        print("Credentials not configured.")
+        print("Run 'python main.py setup' first, or set environment variables:")
+        print("  GOOGLE_EMAIL, GOOGLE_PASSWORD, ANDROID_ID")
+        sys.exit(1)
+
+    print("WhatsApp Backup Downloader")
+    print("=" * 30)
+
     try:
-        # Initialize Google Drive service
-        print("Connecting to Google Drive...")
-        drive_service = DriveService(config)
-        
-        # Recherche spécifique du dossier "Sauvegardes"
-        print("Recherche du dossier Sauvegardes...")
-        backups_folder_query = "name = 'Sauvegardes' and mimeType = 'application/vnd.google-apps.folder'"
-        backups_folders = drive_service.list_files(query=backups_folder_query)
-        
-        if backups_folders:
-            print(f"Dossier 'Sauvegardes' trouvé! ID: {backups_folders[0]['id']}")
-            # Lister le contenu du dossier Sauvegardes
-            folder_content_query = f"'{backups_folders[0]['id']}' in parents"
-            folder_contents = drive_service.list_files(query=folder_content_query)
-            print(f"Contenu du dossier 'Sauvegardes': {len(folder_contents)} fichiers/dossiers")
-            
-            for item in folder_contents:
-                print(f"- {item.get('name')} (Type: {item.get('mimeType')})")
-        
-        # Find WhatsApp backups
-        print("\nRecherche des sauvegardes WhatsApp...")
-        backup_finder = BackupFinder(drive_service)
-        backups = backup_finder.find_backups()
-        
-        # Download backups
-        downloader = Downloader(drive_service, config)
-        success = downloader.download_backups(backups)
-        
-        if success:
-            print("\nTéléchargement des sauvegardes terminé!")
-            print(f"Fichiers sauvegardés dans: {os.path.abspath(config.backup_dir)}")
+        # Initialize authentication and API
+        auth = GoogleAuth(config.google_email, config.google_password, config.android_id)
+        api = BackupAPI(auth)
+
+        if command == 'info':
+            cmd_info(api)
+        elif command == 'list':
+            cmd_list(api)
+        elif command == 'sync':
+            cmd_sync(api, config.backup_dir)
         else:
-            print("\nAucune sauvegarde n'a été téléchargée.")
-            print("\nVérification supplémentaire - Recherche manuelle de tous les fichiers contenant 'WhatsApp'...")
-            
-            # Recherche élargie en dernier recours
-            whatsapp_query = "name contains 'WhatsApp'"
-            whatsapp_files = drive_service.list_files(query=whatsapp_query)
-            
-            if whatsapp_files:
-                print(f"Trouvé {len(whatsapp_files)} fichiers contenant 'WhatsApp' dans le nom:")
-                for file in whatsapp_files:
-                    print(f"- {file.get('name')} (ID: {file.get('id')}, Type: {file.get('mimeType')})")
-                
-                # Option pour télécharger ces fichiers
-                print("\nVoulez-vous télécharger ces fichiers? (y/n)")
-                response = input().strip().lower()
-                
-                if response == 'y':
-                    manual_download_dir = os.path.join(config.backup_dir, 'manual')
-                    os.makedirs(manual_download_dir, exist_ok=True)
-                    
-                    for file in whatsapp_files:
-                        file_path = os.path.join(manual_download_dir, file.get('name', f"whatsapp_file_{file.get('id')}"))
-                        print(f"Téléchargement de {file.get('name')}...")
-                        try:
-                            drive_service.download_file(file.get('id'), file_path)
-                            print(f"Téléchargé avec succès vers {file_path}")
-                        except Exception as e:
-                            print(f"Erreur lors du téléchargement: {str(e)}")
-            else:
-                print("Aucun fichier contenant 'WhatsApp' n'a été trouvé dans votre Google Drive.")
-                print("Assurez-vous que les sauvegardes WhatsApp existent dans votre Google Drive.")
-            
+            print(f"Unknown command: {command}")
+            print_help()
+            sys.exit(1)
+
     except Exception as e:
-        print(f"Erreur: {str(e)}")
-        import traceback
-        traceback.print_exc()
+        print(f"\nError: {str(e)}")
+        sys.exit(1)
+
 
 if __name__ == "__main__":
     main()

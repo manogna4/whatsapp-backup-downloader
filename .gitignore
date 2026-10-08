@@ -2,6 +2,7 @@
 .env
 credentials.json
 token.json
+settings.cfg
 __pycache__/
 *.py[cod]
 *$py.class
